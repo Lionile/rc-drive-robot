@@ -11,10 +11,10 @@
 #include "driver/mcpwm_prelude.h"
 #include "esp_timer.h"
 #include "neural_network.h"
+#include "logging.h"
 
 // --------------- CONFIG ----------------
 #define SERIAL_BAUD     115200
-
 #define INFERENCE_HZ    50
 
 // DRV8833 pins (XIAO ESP32S3) - same as testing receiver
@@ -23,12 +23,12 @@
 #define R_MOT_FWD       2
 #define R_MOT_REV       1
 
-// VL6180X I2C addresses (same as PID code)
+// VL6180X I2C addresses
 #define VL6180X_LEFT_ADDR    0x2A
 #define VL6180X_CENTER_ADDR  0x2B  
 #define VL6180X_RIGHT_ADDR   0x2C
 
-// VL6180X GPIO pins for XSHUT (shutdown) - using same as PID code
+// VL6180X GPIO pins for XSHUT (shutdown)
 #define VL_LEFT_XSHUT   D10  // Left
 #define VL_CENTER_XSHUT D9   // Mid/Center  
 #define VL_RIGHT_XSHUT  D8   // Right
@@ -41,7 +41,7 @@
 #define MAX_SENSOR_DISTANCE_MM  180.0f  // Normalize to this max distance
 #define MIN_SENSOR_DISTANCE_MM  10.0f   // Minimum reliable reading
 
-// Motor scaling: model output [0,1] -> PWM [0, 0.4]
+// Motor scaling: model output [0,1] -> PWM [0, MAX_MOTOR_POWER]
 #define MAX_MOTOR_POWER 0.4f
 // --------------------------------------
 
@@ -49,8 +49,6 @@
 static NeuralNetwork g_neural_net;
 
 static volatile float g_sensor_distances[3] = {0.5f, 0.5f, 0.5f};  // Normalized [0,1]
-static volatile bool g_sensor_updated[3] = {false, false, false};
-static volatile uint32_t g_last_sensor_read[3] = {0, 0, 0};
 
 static esp_timer_handle_t g_inference_timer = nullptr;
 static volatile bool g_inference_tick = false;
@@ -78,13 +76,13 @@ static inline float clamp_f(float x, float lo, float hi) {
     return x < lo ? lo : (x > hi ? hi : x); 
 }
 
-// ---- VL6180X using Adafruit library (same as PID code) ----
+// ---- VL6180X ----
 static Adafruit_VL6180X vl_left, vl_center, vl_right;
 
-// I2C speed (same as PID code)
+// I2C speed
 const uint32_t I2C_HZ = 400000;  // 400 kHz
 
-// I2C register access helpers (from PID code)
+// I2C register access helpers
 uint8_t rd8(uint8_t addr, uint16_t reg) {
     Wire.beginTransmission(addr);
     Wire.write(reg >> 8); 
@@ -102,7 +100,7 @@ void wr8(uint8_t addr, uint16_t reg, uint8_t val) {
     Wire.endTransmission();
 }
 
-// VL6180X fast continuous config (~50 Hz) - from PID code
+// VL6180X fast continuous config (~50 Hz)
 void vl6180x_fastInit(uint8_t addr) {
     wr8(addr, 0x0014, 0x04);  // Interrupt config
     wr8(addr, 0x001C, 12);    // Range measurement period
@@ -111,7 +109,7 @@ void vl6180x_fastInit(uint8_t addr) {
     wr8(addr, 0x0018, 0x03);  // Start continuous ranging
 }
 
-// Fast register-based sensor status and read (from PID code)
+// Fast register-based sensor status and read
 inline bool vl6180x_ready(uint8_t addr) { 
     return (rd8(addr, 0x004F) & 0x07) == 0x04; 
 }
@@ -122,11 +120,9 @@ inline uint8_t vl6180x_read_mm(uint8_t addr) {
     return mm;
 }
 
-inline uint8_t clamp180(uint8_t mm) { 
-    return (mm > 180) ? 180 : mm; 
-}
 
-// Helper function for sensor initialization (from PID code)
+
+// Helper function for sensor initialization
 bool initOneTOF_SHDN(int shdnPin, Adafruit_VL6180X &dev, uint8_t newAddr) {
     pinMode(shdnPin, OUTPUT);
     digitalWrite(shdnPin, HIGH);
@@ -241,7 +237,7 @@ static bool initSensors() {
     Wire.begin();
     Wire.setClock(I2C_HZ);
     
-    // Configure XSHUT pins and reset all sensors (same as PID code)
+    // Configure XSHUT pins and reset all sensors
     pinMode(VL_LEFT_XSHUT, OUTPUT);
     pinMode(VL_CENTER_XSHUT, OUTPUT);
     pinMode(VL_RIGHT_XSHUT, OUTPUT);
@@ -250,31 +246,31 @@ static bool initSensors() {
     digitalWrite(VL_RIGHT_XSHUT, LOW);
     delay(10);
     
-    // Initialize sensors one by one with retry (same as PID code)
+    // Initialize sensors one by one with retry
     while (!initOneTOF_SHDN(VL_LEFT_XSHUT, vl_left, VL6180X_LEFT_ADDR)) {
         digitalWrite(VL_LEFT_XSHUT, LOW);
         delay(20);
-        Serial.println("Retrying left VL6180X...");
+        LOG_DEBUG("Retrying left VL6180X...\n");
     }
     
     while (!initOneTOF_SHDN(VL_CENTER_XSHUT, vl_center, VL6180X_CENTER_ADDR)) {
         digitalWrite(VL_CENTER_XSHUT, LOW);
         delay(20);
-        Serial.println("Retrying center VL6180X...");
+        LOG_DEBUG("Retrying center VL6180X...\n");
     }
     
     while (!initOneTOF_SHDN(VL_RIGHT_XSHUT, vl_right, VL6180X_RIGHT_ADDR)) {
         digitalWrite(VL_RIGHT_XSHUT, LOW);
         delay(20);
-        Serial.println("Retrying right VL6180X...");
+        LOG_DEBUG("Retrying right VL6180X...\n");
     }
     
-    // Configure sensors for fast continuous reads (from PID code)
+    // Configure sensors for fast continuous reads
     vl6180x_fastInit(VL6180X_LEFT_ADDR);
     vl6180x_fastInit(VL6180X_CENTER_ADDR);
     vl6180x_fastInit(VL6180X_RIGHT_ADDR);
     
-    Serial.println("All VL6180X sensors initialized and configured for continuous reads");
+    LOG_INFO("All VL6180X sensors initialized and configured for continuous reads\n");
     return true;
 }
 
@@ -302,70 +298,56 @@ static void inference_tick_cb(void* arg) {
 
 // ---- Main Functions ----
 void setup() {
-    Serial.begin(SERIAL_BAUD);
+    LOG_INIT(SERIAL_BAUD);
     delay(100);
-    Serial.println("=== RL CONTROLLER ===");
+    LOG_PRINTLN("=== RL CONTROLLER ===");
     
     // Print model configuration
-    Serial.printf("Model: %d inputs, %d outputs, %d layers\n", 
+    LOG_INFO("Model: %d inputs, %d outputs, %d layers\n", 
                   ACTOR_INPUT_DIM, ACTOR_OUTPUT_DIM, ACTOR_NUM_LAYERS);
-    Serial.printf("Past states: %s, count=%d, stride=%d, source=%s\n",
+    LOG_INFO("Past states: %s, count=%d, stride=%d, source=%s\n",
                   PAST_STATES_ENABLED ? "enabled" : "disabled",
-                  PAST_STATES_COUNT, PAST_STATES_STRIDE, PAST_STATES_SOURCE);
+                  PAST_STATES_COUNT, PAST_STATES_STRIDE, 
+                  PAST_STATES_ENABLED ? (PAST_STATES_USE_SENSORS ? "sensors" : "wheels") : "none");
     
     // Setup hardware
     mcpwm_setup();
     stopMotors();
     
     if(!initSensors()) {
-        Serial.println("Sensor initialization failed!");
+        LOG_ERROR("Sensor initialization failed!\n");
         while(1) delay(1000);
     }
     
-    // Setup inference timer (sensor reading now in main loop like PID code)
+    // Setup inference timer
     esp_timer_create_args_t inference_args = {};
     inference_args.callback = &inference_tick_cb;
     inference_args.name = "inference_50hz";
     ESP_ERROR_CHECK(esp_timer_create(&inference_args, &g_inference_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(g_inference_timer, 1000000ULL / INFERENCE_HZ));
     
-    Serial.println("RL Controller ready - starting autonomous operation");
+    LOG_INFO("RL Controller ready - starting autonomous operation\n");
     
     // Wait a bit for sensors to stabilize
     delay(1000);
 }
 
 void loop() {
-    // Check all sensors on each loop cycle (like PID code - more efficient for continuous mode)
+    // Check all sensors on each loop cycle (more efficient for continuous mode)
     if (vl6180x_ready(VL6180X_LEFT_ADDR)) {
-        uint32_t read_start = micros();
-        uint8_t range = clamp180(vl6180x_read_mm(VL6180X_LEFT_ADDR));
-        uint32_t read_time = micros() - read_start;
+        uint8_t range = vl6180x_read_mm(VL6180X_LEFT_ADDR);
         g_sensor_distances[0] = normalizeSensorReading(range);
-        g_sensor_updated[0] = true;
-        g_last_sensor_read[0] = millis();
-        Serial.printf("[TIMING] Left sensor read: %lu us\n", read_time);
     }
     if (vl6180x_ready(VL6180X_CENTER_ADDR)) {
-        uint32_t read_start = micros();
-        uint8_t range = clamp180(vl6180x_read_mm(VL6180X_CENTER_ADDR));
-        uint32_t read_time = micros() - read_start;
+        uint8_t range = vl6180x_read_mm(VL6180X_CENTER_ADDR);
         g_sensor_distances[1] = normalizeSensorReading(range);
-        g_sensor_updated[1] = true;
-        g_last_sensor_read[1] = millis();
-        Serial.printf("[TIMING] Center sensor read: %lu us\n", read_time);
     }
     if (vl6180x_ready(VL6180X_RIGHT_ADDR)) {
-        uint32_t read_start = micros();
-        uint8_t range = clamp180(vl6180x_read_mm(VL6180X_RIGHT_ADDR));
-        uint32_t read_time = micros() - read_start;
+        uint8_t range = vl6180x_read_mm(VL6180X_RIGHT_ADDR);
         g_sensor_distances[2] = normalizeSensorReading(range);
-        g_sensor_updated[2] = true;
-        g_last_sensor_read[2] = millis();
-        Serial.printf("[TIMING] Right sensor read: %lu us\n", read_time);
     }
     
-    // 50Hz neural network inference
+    // neural network inference
     if(g_inference_tick) {
         g_inference_tick = false;
         
@@ -382,22 +364,12 @@ void loop() {
         // Update neural network with wheel outputs (for models that use past wheel states)
         g_neural_net.updateWheelState(wheel_outputs, 2);
         
-        uint32_t inference_time = micros() - inference_start;
-        
         // Apply motor commands
         applyWheelCommands(wheel_outputs[0], wheel_outputs[1]);
         
+        uint32_t inference_time = micros() - inference_start;
+
         // Timing output
-        Serial.printf("[TIMING] Neural network inference: %lu us\n", inference_time);
-    }
-    
-    // Emergency stop via serial
-    if(Serial.available()) {
-        String cmd = Serial.readStringUntil('\n');
-        cmd.trim();
-        if(cmd.equalsIgnoreCase("S") || cmd.equalsIgnoreCase("STOP")) {
-            stopMotors();
-            Serial.println("EMERGENCY STOP");
-        }
+        LOG_TIMING("[TIMING] Neural network inference + action: %lu us\n", inference_time);
     }
 }
