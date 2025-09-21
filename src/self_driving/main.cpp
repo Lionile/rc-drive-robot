@@ -43,6 +43,9 @@
 
 // Motor scaling: model output [0,1] -> PWM [0, MAX_MOTOR_POWER]
 #define MAX_MOTOR_POWER 0.4f
+// Turn gain: multiply the differential (left-right) by this factor to change turning authority
+// 1.0 = no change, <1.0 reduces turning, >1.0 increases turning
+#define TURN_GAIN 0.5f
 // --------------------------------------
 
 // ---- Globals ----
@@ -216,11 +219,36 @@ static void setWheel(float u, mcpwm_cmpr_handle_t cmp_fwd, mcpwm_cmpr_handle_t c
 }
 
 static void applyWheelCommands(float left_speed, float right_speed) {
-    // Scale from [0,1] to [-MAX_MOTOR_POWER, MAX_MOTOR_POWER]
-    // For now, assume forward-only (no reverse)
-    float left_pwm = left_speed * MAX_MOTOR_POWER;
-    float right_pwm = right_speed * MAX_MOTOR_POWER;
-    
+    // Inputs may be in either range depending on ACTOR_ALLOW_REVERSE:
+    // - If reverse is disallowed: outputs are in [0,1] (forward-only)
+    // - If reverse allowed: outputs are in [-1,1]
+    // We want to scale only the turning component (difference between wheels) while preserving
+    // the average forward speed (so top speed is unaffected).
+
+    // Compute average (forward) and differential (turn)
+    float avg = (left_speed + right_speed) * 0.5f;
+    float diff = (left_speed - right_speed) * 0.5f; // positive -> left faster -> turn right
+
+    // Apply turn gain to differential only
+    diff *= TURN_GAIN;
+
+    // Reconstruct wheel commands
+    float left_adj = avg + diff;
+    float right_adj = avg - diff;
+
+    // Clamp to the valid range depending on ACTOR_ALLOW_REVERSE
+    if(!ACTOR_ALLOW_REVERSE) {
+        left_adj = clamp_f(left_adj, 0.0f, 1.0f);
+        right_adj = clamp_f(right_adj, 0.0f, 1.0f);
+    } else {
+        left_adj = clamp_f(left_adj, -1.0f, 1.0f);
+        right_adj = clamp_f(right_adj, -1.0f, 1.0f);
+    }
+
+    // Map to PWM using MAX_MOTOR_POWER (preserves top speed)
+    float left_pwm = left_adj * MAX_MOTOR_POWER;
+    float right_pwm = right_adj * MAX_MOTOR_POWER;
+
     setWheel(left_pwm, cmp_l_fwd, cmp_l_rev);
     setWheel(right_pwm, cmp_r_fwd, cmp_r_rev);
 }
