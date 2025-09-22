@@ -17,8 +17,8 @@
 // --------------- CONFIG ----------------
 #define SERIAL_BAUD     115200
 
-#define ESPNOW_CHANNEL  1
-#define TEL_HZ          50
+#define ESPNOW_CHANNEL  6  // Changed from 1 to 6 (less crowded channel)
+#define TEL_HZ          50  // Reduced from 50 to 20 Hz for more reliable transmission
 #define CTRL_HZ         500
 
 // DRV8833 pins (XIAO ESP32S3)
@@ -53,13 +53,19 @@ struct CmdMsg {
   uint8_t reset_yaw;    // 1 = reset yaw to 0
   uint8_t recal_gyro;   // 1 = recalibrate gyro bias
 };
-struct TelemetryMsg {
-  uint32_t seq_rx;
+struct TelemetrySample {
   uint32_t millis_rx;
   float yaw_deg;
-  float gz_dps;
   float uL_applied;
   float uR_applied;
+  // Full IMU data
+  int16_t accel[3];  // Raw accelerometer: X, Y, Z
+  int16_t gyro[3];   // Raw gyroscope: X, Y, Z
+};
+struct TelemetryMsg {
+  uint32_t seq_rx;
+  uint8_t sample_count;  // Number of batched samples
+  TelemetrySample samples[5];  // Batch up to 5 samples (120 bytes total)
 };
 #pragma pack(pop)
 
@@ -79,6 +85,12 @@ static esp_timer_handle_t g_ctrl_timer = nullptr;
 static volatile bool g_ctrl_tick = false;
 
 static uint32_t g_last_tel_ms = 0;
+
+// ---- Telemetry batching ----
+#define BATCH_SIZE 5  // Send every 3 samples (every 150ms instead of 50ms)
+static TelemetrySample g_telemetry_buffer[BATCH_SIZE];
+static uint8_t g_batch_index = 0;
+static uint32_t g_batch_seq = 1;
 
 // MCPWM handles
 static mcpwm_timer_handle_t   pwm_timer   = nullptr;
@@ -107,6 +119,25 @@ static int16_t mpu_read16(uint8_t reg_high) {
   Wire.requestFrom(MPU_ADDR, (uint8_t)2, (uint8_t)true);
   int16_t v = (Wire.read() << 8) | Wire.read();
   return v;
+}
+static void mpu_read_accel_gyro_burst(int16_t* accel, int16_t* gyro) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B); // ACCEL_XOUT_H
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, (uint8_t)14, (uint8_t)true); // 6 accel + 2 temp + 6 gyro bytes
+  uint8_t data[14];
+  for (int i = 0; i < 14; i++) {
+    data[i] = Wire.read();
+  }
+  // Accel: X, Y, Z (registers 0x3B-0x40)
+  accel[0] = (data[0] << 8) | data[1]; // ACCEL_X
+  accel[1] = (data[2] << 8) | data[3]; // ACCEL_Y
+  accel[2] = (data[4] << 8) | data[5]; // ACCEL_Z
+  // Skip temperature (data[6-7])
+  // Gyro: X, Y, Z (registers 0x43-0x48)
+  gyro[0] = (data[8] << 8) | data[9];   // GYRO_X
+  gyro[1] = (data[10] << 8) | data[11]; // GYRO_Y
+  gyro[2] = (data[12] << 8) | data[13]; // GYRO_Z
 }
 static bool mpu_init() {
   Wire.begin();
@@ -247,6 +278,17 @@ static void stopMotors() {
 }
 
 // ---- ESP-NOW ----
+// Add global for transmit timing
+static volatile uint32_t g_tx_start_us = 0;
+static volatile uint32_t g_tx_time_us = 0;
+
+static void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
+  if (g_tx_start_us > 0) {
+    g_tx_time_us = micros() - g_tx_start_us;
+    g_tx_start_us = 0;  // Reset
+  }
+}
+
 static void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (len == (int)sizeof(CmdMsg)) {
     CmdMsg in{};
@@ -282,16 +324,38 @@ static void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int
                   (unsigned long)in.seq, uL, uR, (unsigned long)dur, reset_yaw, recal_gyro);
   }
 }
-static void sendTelemetry(float yaw_deg, float gz_dps) {
-  TelemetryMsg t{};
-  static uint32_t txseq = 1;
-  t.seq_rx     = txseq++;
-  t.millis_rx  = millis();
-  t.yaw_deg    = yaw_deg;
-  t.gz_dps     = gz_dps;
-  t.uL_applied = g_uL;
-  t.uR_applied = g_uR;
-  esp_now_send(g_peer_mac, (uint8_t*)&t, sizeof(t));
+static void sendTelemetry(float yaw_deg, int16_t* accel, int16_t* gyro) {
+  // Add sample to batch
+  g_telemetry_buffer[g_batch_index].millis_rx = millis();
+  g_telemetry_buffer[g_batch_index].yaw_deg = yaw_deg;
+  g_telemetry_buffer[g_batch_index].uL_applied = g_uL;
+  g_telemetry_buffer[g_batch_index].uR_applied = g_uR;
+  // Add full IMU data
+  memcpy(g_telemetry_buffer[g_batch_index].accel, accel, sizeof(int16_t) * 3);
+  memcpy(g_telemetry_buffer[g_batch_index].gyro, gyro, sizeof(int16_t) * 3);
+  g_batch_index++;
+
+  // Send batch when full
+  if (g_batch_index >= BATCH_SIZE) {
+    TelemetryMsg t{};
+    t.seq_rx = g_batch_seq++;
+    t.sample_count = BATCH_SIZE;
+    memcpy(t.samples, g_telemetry_buffer, sizeof(TelemetrySample) * BATCH_SIZE);
+    
+    // Record transmit start time
+    g_tx_start_us = micros();
+    esp_now_send(g_peer_mac, (uint8_t*)&t, sizeof(t));
+    
+    // Print transmit time when available (will be updated by callback)
+    static uint32_t last_print = 0;
+    if (g_tx_time_us > 0 && millis() - last_print > 1000) {  // Print every ~1s
+      Serial.printf("[TX TIME] ESP-NOW transmit: %lu us (batched %d samples)\n", (unsigned long)g_tx_time_us, BATCH_SIZE);
+      g_tx_time_us = 0;  // Reset after printing
+      last_print = millis();
+    }
+    
+    g_batch_index = 0;  // Reset batch
+  }
 }
 
 // ---- Control/IMU periodic ----
@@ -337,18 +401,27 @@ void setup() {
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   delay(100);
 
+  // Optimize WiFi for faster ESP-NOW transmission
+  esp_wifi_set_max_tx_power(78);  // Max TX power (78 = 19.5 dBm)
+  esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_MCS7_SGI);  // High data rate
+
   if (esp_now_init()!=ESP_OK) {
     Serial.println("ESP-NOW init FAILED, rebooting...");
     delay(1000); ESP.restart();
   }
   
+  // Optimize ESP-NOW for faster transmission
+  esp_now_set_pmk((uint8_t*)"pmk1234567890123");  // Set PMK for faster peer addition
+  
   esp_now_register_recv_cb(onDataRecv);
+  esp_now_register_send_cb(onDataSent);
 
   // Add transmitter as peer
   esp_now_peer_info_t peer_info = {};
   memcpy(peer_info.peer_addr, g_peer_mac, 6);
   peer_info.channel = ESPNOW_CHANNEL;
   peer_info.encrypt = false;
+  peer_info.ifidx = WIFI_IF_STA;  // Specify interface
   
   if (esp_now_add_peer(&peer_info) != ESP_OK) {
     Serial.println("Failed to add peer");
@@ -378,8 +451,22 @@ void loop() {
     if (dt <= 0 || dt > 0.5f) dt = 1.0f/CTRL_HZ;
     last_us = now_us;
 
-    // IMU: read gyro Z, handle recalibration if needed, integrate yaw
-    int16_t gz_raw = mpu_read16(0x47);   // GYRO_ZOUT_H
+    // IMU: read accel and gyro, measure time
+    static uint32_t imu_print_count = 0;
+    uint32_t imu_read_start = micros();
+    // Read accel and gyro in burst
+    int16_t accel[3], gyro[3];
+    mpu_read_accel_gyro_burst(accel, gyro);
+    int16_t ax_raw = accel[0];
+    int16_t ay_raw = accel[1];
+    int16_t az_raw = accel[2];
+    int16_t gx_raw = gyro[0];
+    int16_t gy_raw = gyro[1];
+    int16_t gz_raw = gyro[2];
+    uint32_t imu_read_end = micros();
+    if (++imu_print_count % 500 == 0) {
+      Serial.printf("IMU read time: %lu us\n", imu_read_end - imu_read_start);
+    }
     float gz_dps = -(float)gz_raw / GYRO_SENS_DPS;  // Negate for correct turn direction
 
     // Handle gyro recalibration if in progress
@@ -414,7 +501,7 @@ void loop() {
     // Telemetry
     if (ms - g_last_tel_ms >= (1000 / TEL_HZ)) {
       g_last_tel_ms = ms;
-      sendTelemetry(g_yaw_deg, gz_dps);
+      sendTelemetry(g_yaw_deg, accel, gyro);
     }
   }
 

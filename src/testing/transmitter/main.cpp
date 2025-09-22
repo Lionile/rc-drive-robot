@@ -7,7 +7,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>   // esp_wifi_get_mac, esp_wifi_set_channel
 
-#define ESPNOW_CHANNEL 1      // Try channel 1 instead of 6
+#define ESPNOW_CHANNEL 6      // Changed from 1 to 6 (less crowded channel)
 #define SERIAL_BAUD   115200
 
 // ------------ Message formats ------------
@@ -23,11 +23,15 @@ struct CmdMsg {
 
 struct TelemetryMsg {
   uint32_t seq_rx;      // receiver's seq counter
-  uint32_t millis_rx;   // receiver milliseconds
-  float yaw_deg;        // integrated yaw (deg)
-  float gz_dps;         // instantaneous gyro z (deg/s)
-  float uL_applied;     // applied on receiver
-  float uR_applied;
+  uint8_t sample_count; // number of batched samples
+  struct {
+    uint32_t millis_rx;   // receiver milliseconds
+    float yaw_deg;        // integrated yaw (deg)
+    float uL_applied;     // applied on receiver
+    float uR_applied;
+    int16_t accel[3];     // Raw accelerometer: X, Y, Z
+    int16_t gyro[3];      // Raw gyroscope: X, Y, Z
+  } samples[5];  // Batch up to 5 samples
 };
 #pragma pack(pop)
 
@@ -67,9 +71,16 @@ static void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int
   if (len == (int)sizeof(TelemetryMsg)) {
     TelemetryMsg t;
     memcpy(&t, data, sizeof(t));
-    Serial.printf("[TEL] rxSeq=%lu  t=%lums  yaw=%.2f°  gz=%.2f dps  uL=%.2f  uR=%.2f\n",
-                  (unsigned long)t.seq_rx, (unsigned long)t.millis_rx,
-                  t.yaw_deg, t.gz_dps, t.uL_applied, t.uR_applied);
+    
+    // Print each sample in the batch as individual [TEL] messages to match robot_control.py format
+    for (uint8_t i = 0; i < t.sample_count && i < 5; i++) {
+      Serial.printf("[TEL] rxSeq=%lu  t=%lums  yaw=%.2f°  uL=%.2f  uR=%.2f  ax=%d ay=%d az=%d  gx=%d gy=%d gz=%d\n",
+                    (unsigned long)t.seq_rx, (unsigned long)t.samples[i].millis_rx,
+                    t.samples[i].yaw_deg, 
+                    t.samples[i].uL_applied, t.samples[i].uR_applied,
+                    t.samples[i].accel[0], t.samples[i].accel[1], t.samples[i].accel[2],
+                    t.samples[i].gyro[0], t.samples[i].gyro[1], t.samples[i].gyro[2]);
+    }
   } else {
     Serial.printf("[TEL] %d bytes\n", len);
   }
@@ -98,6 +109,7 @@ static bool addPeer() {
   memcpy(p.peer_addr, peerMac, 6);
   p.channel = ESPNOW_CHANNEL;
   p.encrypt = false;
+  p.ifidx = WIFI_IF_STA;  // Specify interface
 
   Serial.printf("[DEBUG] Current WiFi channel: %d, Peer channel: %d\n", current_channel, p.channel);
 
@@ -175,10 +187,17 @@ void setup() {
     Serial.printf("After retry - WiFi channel: %d\n", current_channel);
   }
 
+  // Optimize WiFi for faster ESP-NOW transmission
+  esp_wifi_set_max_tx_power(78);  // Max TX power (78 = 19.5 dBm)
+  esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_MCS7_SGI);  // High data rate
+
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed! Rebooting...");
     delay(1000); ESP.restart();
   }
+  
+  // Optimize ESP-NOW for faster transmission
+  esp_now_set_pmk((uint8_t*)"pmk1234567890123");  // Set PMK for faster peer addition
   
   // Verify channel after ESP-NOW init
   esp_wifi_get_channel(&current_channel, &second);
