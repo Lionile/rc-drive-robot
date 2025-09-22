@@ -28,8 +28,11 @@ class RobotControlGUI:
 
         # Data storage
         self.yaw_angle = 0.0
-        self.uL_applied = 0.0
-        self.uR_applied = 0.0
+        self.sensor_left = 0.0
+        self.sensor_center = 0.0
+        self.sensor_right = 0.0
+        self.nn_left = 0.0
+        self.nn_right = 0.0
         self.accel_x = 0
         self.accel_y = 0
         self.accel_z = 0
@@ -208,25 +211,31 @@ class RobotControlGUI:
                 break
 
     def parse_telemetry(self, line):
-        # Example: [TEL] ... yaw=19.65°  uL=0.00  uR=0.00  ax=296 ay=420 az=17460  gx=-32 gy=-6 gz=32
-        tel_pattern = r'\[TEL\].*?yaw=([-\d\.]+)°.*?uL=([-\d\.]+).*?uR=([-\d\.]+).*?ax=(-?\d+).*?ay=(-?\d+).*?az=(-?\d+).*?gx=(-?\d+).*?gy=(-?\d+).*?gz=(-?\d+)'
+        # Example: [TEL] rxSeq=1 t=1234ms sl=0.500 sc=0.300 sr=0.800 nl=0.450 nr=0.550 yaw=19.65° ax=296 ay=420 az=17460 gx=-32 gy=-6 gz=32
+        tel_pattern = r'\[TEL\].*?sl=([-\d\.]+).*?sc=([-\d\.]+).*?sr=([-\d\.]+).*?nl=([-\d\.]+).*?nr=([-\d\.]+).*?yaw=([-\d\.]+)°.*?ax=(-?\d+).*?ay=(-?\d+).*?az=(-?\d+).*?gx=(-?\d+).*?gy=(-?\d+).*?gz=(-?\d+)'
         match = re.search(tel_pattern, line)
         if match:
-            self.yaw_angle = float(match.group(1))
-            self.uL_applied = float(match.group(2))
-            self.uR_applied = float(match.group(3))
-            self.accel_x = int(match.group(4))
-            self.accel_y = int(match.group(5))
-            self.accel_z = int(match.group(6))
-            self.gyro_x = int(match.group(7))
-            self.gyro_y = int(match.group(8))
-            self.gyro_z = int(match.group(9))
+            self.sensor_left = float(match.group(1))
+            self.sensor_center = float(match.group(2))
+            self.sensor_right = float(match.group(3))
+            self.nn_left = float(match.group(4))
+            self.nn_right = float(match.group(5))
+            self.yaw_angle = float(match.group(6))
+            self.accel_x = int(match.group(7))
+            self.accel_y = int(match.group(8))
+            self.accel_z = int(match.group(9))
+            self.gyro_x = int(match.group(10))
+            self.gyro_y = int(match.group(11))
+            self.gyro_z = int(match.group(12))
 
             self.telemetry_history.append({
                 'time': time.time(),
+                'sensor_left': self.sensor_left,
+                'sensor_center': self.sensor_center,
+                'sensor_right': self.sensor_right,
+                'nn_left': self.nn_left,
+                'nn_right': self.nn_right,
                 'yaw': self.yaw_angle,
-                'uL': self.uL_applied,
-                'uR': self.uR_applied,
                 'ax': self.accel_x,
                 'ay': self.accel_y,
                 'az': self.accel_z,
@@ -351,10 +360,10 @@ class RobotControlGUI:
         # Update telemetry labels
         self.yaw_label.config(text=f"Yaw: {self.yaw_angle:.1f}°")
         self.gz_label.config(text=f"Gyro Z (raw): {self.gyro_z}")
-        self.motor_label.config(text=f"Motors: L={self.uL_applied:.2f}, R={self.uR_applied:.2f}")
+        self.motor_label.config(text=f"Sensors: L={self.sensor_left:.3f}, C={self.sensor_center:.3f}, R={self.sensor_right:.3f}")
         self.imu_label.config(
-            text=f"IMU - Accel: X={self.accel_x}, Y={self.accel_y}, Z={self.accel_z} | "
-                 f"Gyro: X={self.gyro_x}, Y={self.gyro_y}, Z={self.gyro_z}"
+            text=f"NN Output: L={self.nn_left:.3f}, R={self.nn_right:.3f} | "
+                 f"IMU Accel: X={self.accel_x}, Y={self.accel_y}, Z={self.accel_z}"
         )
 
         # Redraw visuals

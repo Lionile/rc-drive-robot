@@ -1,12 +1,16 @@
 // RL Controller for Seeed XIAO ESP32S3
 // - MCPWM @ 20 kHz driving DRV8833 
 // - VL6180X distance sensors (3x: Left, Center, Right)
+// - MPU6050 IMU with yaw integration
 // - Neural network inference at 50Hz
+// - ESP-NOW telemetry transmission (batched)
 // - Dynamic past states support (sensors or wheel outputs)
-// - No ESP-NOW, no IMU for simplicity
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <Adafruit_VL6180X.h>
 #include "driver/mcpwm_prelude.h"
 #include "esp_timer.h"
@@ -16,6 +20,9 @@
 // --------------- CONFIG ----------------
 #define SERIAL_BAUD     115200
 #define INFERENCE_HZ    50
+
+#define ESPNOW_CHANNEL  6  // ESP-NOW channel
+#define TEL_BATCH_SIZE  5  // Send telemetry in batches of 5
 
 // DRV8833 pins (XIAO ESP32S3) - same as testing receiver
 #define L_MOT_FWD       3
@@ -33,6 +40,12 @@
 #define VL_CENTER_XSHUT D9   // Mid/Center  
 #define VL_RIGHT_XSHUT  D8   // Right
 
+// MPU6050
+#define MPU_ADDR        0x68
+static const float GYRO_SENS_DPS = 16.4f; // FS_SEL=3 (±2000 dps)
+static const float GYRO_GAIN_CORR = 1.0127f; // Gain correction
+#define GYRO_CAL_MS     4000
+
 // PWM configuration - same as testing receiver
 #define PWM_FREQ_HZ     20000
 #define PWM_RES_HZ      1000000
@@ -42,10 +55,31 @@
 #define MIN_SENSOR_DISTANCE_MM  10.0f   // Minimum reliable reading
 
 // Motor scaling: model output [0,1] -> PWM [0, MAX_MOTOR_POWER]
-#define MAX_MOTOR_POWER 0.4f
+#define MAX_MOTOR_POWER 0.5f
 // Turn gain: multiply the differential (left-right) by this factor to change turning authority
 // 1.0 = no change, <1.0 reduces turning, >1.0 increases turning
-#define TURN_GAIN 0.5f
+#define TURN_GAIN 0.6f
+// --------------------------------------
+
+// ---- Messages ----
+#pragma pack(push,1)
+struct TelemetrySample {
+  uint32_t millis_sent;
+  float sensor_left;      // VL6180X left distance (normalized)
+  float sensor_center;    // VL6180X center distance (normalized)
+  float sensor_right;     // VL6180X right distance (normalized)
+  float nn_output_left;   // Neural network left wheel command
+  float nn_output_right;  // Neural network right wheel command
+  float yaw_deg;          // Integrated yaw angle
+  int16_t accel[3];       // Raw accelerometer: X, Y, Z
+  int16_t gyro[3];        // Raw gyroscope: X, Y, Z
+};
+struct TelemetryMsg {
+  uint32_t seq_tx;
+  uint8_t sample_count;
+  TelemetrySample samples[TEL_BATCH_SIZE];
+};
+#pragma pack(pop)
 // --------------------------------------
 
 // ---- Globals ----
@@ -55,6 +89,22 @@ static volatile float g_sensor_distances[3] = {0.5f, 0.5f, 0.5f};  // Normalized
 
 static esp_timer_handle_t g_inference_timer = nullptr;
 static volatile bool g_inference_tick = false;
+
+// IMU globals
+static volatile float g_yaw_deg = 0.0f;
+static float g_gz_bias = 0.0f;
+static bool g_imu_ready = false;
+static uint32_t g_imu_calib_end_ms = 0;
+
+// ESP-NOW globals
+static uint8_t g_peer_mac[6] = {0x54, 0x32, 0x04, 0x21, 0x80, 0x28};
+static volatile uint32_t g_tx_start_us = 0;
+static volatile uint32_t g_tx_time_us = 0;
+static uint32_t g_telemetry_seq = 1;
+
+// Telemetry batching
+static TelemetrySample g_telemetry_buffer[TEL_BATCH_SIZE];
+static uint8_t g_batch_index = 0;
 
 // MCPWM handles - same setup as testing receiver
 static mcpwm_timer_handle_t   pwm_timer   = nullptr;
@@ -317,6 +367,110 @@ static float normalizeSensorReading(uint8_t range_mm) {
     return (distance - MIN_SENSOR_DISTANCE_MM) / (MAX_SENSOR_DISTANCE_MM - MIN_SENSOR_DISTANCE_MM);
 }
 
+// ---- MPU6050 IMU ----
+static int16_t mpu_read16(uint8_t reg_high) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg_high);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, (uint8_t)2, (uint8_t)true);
+  int16_t v = (Wire.read() << 8) | Wire.read();
+  return v;
+}
+
+static void mpu_read_accel_gyro_burst(int16_t* accel, int16_t* gyro) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B); // ACCEL_XOUT_H
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, (uint8_t)14, (uint8_t)true); // 6 accel + 2 temp + 6 gyro bytes
+  uint8_t data[14];
+  for (int i = 0; i < 14; i++) {
+    data[i] = Wire.read();
+  }
+  // Accel: X, Y, Z (registers 0x3B-0x40)
+  accel[0] = (data[0] << 8) | data[1]; // ACCEL_X
+  accel[1] = (data[2] << 8) | data[3]; // ACCEL_Y
+  accel[2] = (data[4] << 8) | data[5]; // ACCEL_Z
+  // Skip temperature (data[6-7])
+  // Gyro: X, Y, Z (registers 0x43-0x48)
+  gyro[0] = (data[8] << 8) | data[9];   // GYRO_X
+  gyro[1] = (data[10] << 8) | data[11]; // GYRO_Y
+  gyro[2] = (data[12] << 8) | data[13]; // GYRO_Z
+}
+
+static bool mpu_init() {
+  Wire.begin();
+  Wire.setClock(400000);
+  delay(50);
+  // Wake up
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x6B); Wire.write(0x00);
+  if (Wire.endTransmission()!=0) return false;
+  delay(5);
+  // Gyro FS = +/-2000 dps (maximum range for extreme turns)
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x1B); Wire.write(0x18);
+  Wire.endTransmission();
+
+  g_imu_calib_end_ms = millis() + GYRO_CAL_MS;
+  g_gz_bias = 0.0f;
+  g_imu_ready = false;
+  return true;
+}
+
+// Blocking calibration: compute gyro Z bias for the specified duration
+static void calibrate_gyro_bias_blocking(uint32_t ms)
+{
+  Serial.printf("Calibrating gyro bias for %lu ms...\n", (unsigned long)ms);
+  const uint32_t t_end = millis() + ms;
+  double acc = 0.0;
+  uint32_t n = 0;
+  uint32_t last_print = millis();
+  while ((int32_t)(t_end - millis()) > 0) {
+    int16_t gz_raw = mpu_read16(0x47); // GYRO_ZOUT_H
+    float gz_dps = -(float)gz_raw / GYRO_SENS_DPS; // sign for turn direction
+    acc += (double)gz_dps;
+    n++;
+    // Light pacing ~1 kHz depending on I2C speed; no delay needed but add a tiny one
+    delayMicroseconds(500);
+    if (millis() - last_print >= 1000) {
+      Serial.print(".");
+      last_print = millis();
+    }
+  }
+  g_gz_bias = (n > 0) ? (float)(acc / (double)n) : 0.0f;
+  g_imu_ready = true;
+  Serial.printf("\nGyro calibration complete. Bias: %.3f dps (n=%lu)\n", g_gz_bias, (unsigned long)n);
+}
+
+// ---- ESP-NOW ----
+static void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
+  if (g_tx_start_us > 0) {
+    g_tx_time_us = micros() - g_tx_start_us;
+    g_tx_start_us = 0;  // Reset
+  }
+}
+
+static void sendTelemetryBatch() {
+  if (g_batch_index == 0) return;  // Nothing to send
+
+  TelemetryMsg t{};
+  t.seq_tx = g_telemetry_seq++;
+  t.sample_count = g_batch_index;
+  memcpy(t.samples, g_telemetry_buffer, sizeof(TelemetrySample) * g_batch_index);
+
+  // Record transmit start time
+  g_tx_start_us = micros();
+  esp_now_send(g_peer_mac, (uint8_t*)&t, sizeof(t));
+
+  // Print transmit time when available
+  static uint32_t last_print = 0;
+  if (g_tx_time_us > 0 && millis() - last_print > 1000) {
+    Serial.printf("[TX TIME] ESP-NOW transmit: %lu us (batched %d samples)\n", (unsigned long)g_tx_time_us, g_batch_index);
+    g_tx_time_us = 0;
+    last_print = millis();
+  }
+
+  g_batch_index = 0;  // Reset batch
+}
+
 
 
 // ---- Timer Callbacks ----
@@ -345,6 +499,60 @@ void setup() {
     if(!initSensors()) {
         LOG_ERROR("Sensor initialization failed!\n");
         while(1) delay(1000);
+    }
+    
+    // Setup IMU
+    if (!mpu_init()) {
+        LOG_ERROR("MPU6050 init FAILED\n");
+    } else {
+        // Calibrate gyro bias
+        calibrate_gyro_bias_blocking(GYRO_CAL_MS);
+    }
+    
+    // Setup ESP-NOW
+    WiFi.mode(WIFI_MODE_NULL);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true, true);
+    delay(500);
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+    delay(100);
+
+    // Print MAC address
+    uint8_t mac[6]; esp_wifi_get_mac(WIFI_IF_STA, mac);
+    LOG_INFO("MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+
+    // Set WiFi channel
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    delay(100);
+
+    // Optimize WiFi for faster ESP-NOW transmission
+    esp_wifi_set_max_tx_power(78);  // Max TX power (78 = 19.5 dBm)
+    esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_MCS7_SGI);  // High data rate
+
+    if (esp_now_init()!=ESP_OK) {
+        LOG_ERROR("ESP-NOW init FAILED, rebooting...\n");
+        delay(1000); ESP.restart();
+    }
+    
+    // Optimize ESP-NOW for faster transmission
+    esp_now_set_pmk((uint8_t*)"pmk1234567890123");  // Set PMK for faster peer addition
+    
+    esp_now_register_send_cb(onDataSent);
+
+    // Add transmitter as peer
+    esp_now_peer_info_t peer_info = {};
+    memcpy(peer_info.peer_addr, g_peer_mac, 6);
+    peer_info.channel = ESPNOW_CHANNEL;
+    peer_info.encrypt = false;
+    peer_info.ifidx = WIFI_IF_STA;  // Specify interface
+    
+    if (esp_now_add_peer(&peer_info) != ESP_OK) {
+        LOG_ERROR("Failed to add peer\n");
     }
     
     // Setup inference timer
@@ -381,6 +589,19 @@ void loop() {
         
         uint32_t inference_start = micros();
         
+        // Read IMU data before inference
+        int16_t accel[3], gyro[3];
+        mpu_read_accel_gyro_burst(accel, gyro);
+        
+        // Update yaw integration if IMU is ready
+        if (g_imu_ready) {
+            float gz_dps = -(float)gyro[2] / GYRO_SENS_DPS;  // sign for turn direction
+            float gz_corr = gz_dps - g_gz_bias;
+            g_yaw_deg += gz_corr * (1.0f / INFERENCE_HZ) * GYRO_GAIN_CORR;  // Apply gain correction
+            if (g_yaw_deg >= 180.0f) g_yaw_deg -= 360.0f;
+            else if (g_yaw_deg < -180.0f) g_yaw_deg += 360.0f;
+        }
+        
         // Update neural network with current sensor readings (reordered: center, right, left)
         float sensors[3] = {g_sensor_distances[1], g_sensor_distances[2], g_sensor_distances[0]};
         g_neural_net.updateSensorState(sensors, 3);
@@ -396,6 +617,23 @@ void loop() {
         applyWheelCommands(wheel_outputs[0], wheel_outputs[1]);
         
         uint32_t inference_time = micros() - inference_start;
+
+        // Add telemetry sample
+        g_telemetry_buffer[g_batch_index].millis_sent = millis();
+        g_telemetry_buffer[g_batch_index].sensor_left = g_sensor_distances[0];
+        g_telemetry_buffer[g_batch_index].sensor_center = g_sensor_distances[1];
+        g_telemetry_buffer[g_batch_index].sensor_right = g_sensor_distances[2];
+        g_telemetry_buffer[g_batch_index].nn_output_left = wheel_outputs[0];
+        g_telemetry_buffer[g_batch_index].nn_output_right = wheel_outputs[1];
+        g_telemetry_buffer[g_batch_index].yaw_deg = g_yaw_deg;
+        memcpy(g_telemetry_buffer[g_batch_index].accel, accel, sizeof(int16_t) * 3);
+        memcpy(g_telemetry_buffer[g_batch_index].gyro, gyro, sizeof(int16_t) * 3);
+        g_batch_index++;
+        
+        // Send batch when full
+        if (g_batch_index >= TEL_BATCH_SIZE) {
+            sendTelemetryBatch();
+        }
 
         // Timing output
         LOG_TIMING("[TIMING] Neural network inference + action: %lu us\n", inference_time);
