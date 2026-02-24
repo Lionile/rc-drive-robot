@@ -96,6 +96,10 @@ static float g_gz_bias = 0.0f;
 static bool g_imu_ready = false;
 static uint32_t g_imu_calib_end_ms = 0;
 
+// Previous NN outputs for telemetry pairing
+static float g_prev_nn_left = 0.0f;
+static float g_prev_nn_right = 0.0f;
+
 // ESP-NOW globals
 static uint8_t g_peer_mac[6] = {0x54, 0x32, 0x04, 0x21, 0x80, 0x28};
 static volatile uint32_t g_tx_start_us = 0;
@@ -571,16 +575,25 @@ void setup() {
 void loop() {
     // Check all sensors on each loop cycle (more efficient for continuous mode)
     if (vl6180x_ready(VL6180X_LEFT_ADDR)) {
+        uint32_t read_start = micros();
         uint8_t range = vl6180x_read_mm(VL6180X_LEFT_ADDR);
+        uint32_t read_time = micros() - read_start;
         g_sensor_distances[0] = normalizeSensorReading(range);
+        LOG_TIMING("[SENSOR] Left VL6180X read: %lu us\n", read_time);
     }
     if (vl6180x_ready(VL6180X_CENTER_ADDR)) {
+        uint32_t read_start = micros();
         uint8_t range = vl6180x_read_mm(VL6180X_CENTER_ADDR);
+        uint32_t read_time = micros() - read_start;
         g_sensor_distances[1] = normalizeSensorReading(range);
+        LOG_TIMING("[SENSOR] Center VL6180X read: %lu us\n", read_time);
     }
     if (vl6180x_ready(VL6180X_RIGHT_ADDR)) {
+        uint32_t read_start = micros();
         uint8_t range = vl6180x_read_mm(VL6180X_RIGHT_ADDR);
+        uint32_t read_time = micros() - read_start;
         g_sensor_distances[2] = normalizeSensorReading(range);
+        LOG_TIMING("[SENSOR] Right VL6180X read: %lu us\n", read_time);
     }
     
     // neural network inference
@@ -591,7 +604,10 @@ void loop() {
         
         // Read IMU data before inference
         int16_t accel[3], gyro[3];
+        uint32_t imu_read_start = micros();
         mpu_read_accel_gyro_burst(accel, gyro);
+        uint32_t imu_read_time = micros() - imu_read_start;
+        LOG_TIMING("[IMU] MPU6050 read: %lu us\n", imu_read_time);
         
         // Update yaw integration if IMU is ready
         if (g_imu_ready) {
@@ -618,13 +634,13 @@ void loop() {
         
         uint32_t inference_time = micros() - inference_start;
 
-        // Add telemetry sample
+        // Add telemetry sample - pair current IMU readings with PREVIOUS NN outputs
         g_telemetry_buffer[g_batch_index].millis_sent = millis();
         g_telemetry_buffer[g_batch_index].sensor_left = g_sensor_distances[0];
         g_telemetry_buffer[g_batch_index].sensor_center = g_sensor_distances[1];
         g_telemetry_buffer[g_batch_index].sensor_right = g_sensor_distances[2];
-        g_telemetry_buffer[g_batch_index].nn_output_left = wheel_outputs[0];
-        g_telemetry_buffer[g_batch_index].nn_output_right = wheel_outputs[1];
+        g_telemetry_buffer[g_batch_index].nn_output_left = g_prev_nn_left;   // Use PREVIOUS NN outputs
+        g_telemetry_buffer[g_batch_index].nn_output_right = g_prev_nn_right; // Use PREVIOUS NN outputs
         g_telemetry_buffer[g_batch_index].yaw_deg = g_yaw_deg;
         memcpy(g_telemetry_buffer[g_batch_index].accel, accel, sizeof(int16_t) * 3);
         memcpy(g_telemetry_buffer[g_batch_index].gyro, gyro, sizeof(int16_t) * 3);
@@ -634,6 +650,10 @@ void loop() {
         if (g_batch_index >= TEL_BATCH_SIZE) {
             sendTelemetryBatch();
         }
+
+        // Update previous NN outputs for next telemetry sample
+        g_prev_nn_left = wheel_outputs[0];
+        g_prev_nn_right = wheel_outputs[1];
 
         // Timing output
         LOG_TIMING("[TIMING] Neural network inference + action: %lu us\n", inference_time);
